@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+pydantic-settings
+python-dotenv
+httpx
+playwright
+nest-asyncio
