@@ -1,0 +1,719 @@
+项目 'cursor-2api' 的结构树:
+📂 cursor-2api/
+    📄 .env
+    📄 .env.example
+    📄 Dockerfile
+    📄 docker-compose.yml
+    📄 main.py
+    📄 nginx.conf
+    📄 requirements.txt
+    📂 app/
+        📂 core/
+            📄 __init__.py
+            📄 config.py
+        📂 providers/
+            📄 __init__.py
+            📄 base_provider.py
+            📄 cursor_provider.py
+            📄 fetch_override.js
+        📂 utils/
+            📄 sse_utils.py
+================================================================================
+
+--- 文件路径: .env ---
+
+# ====================================================================
+# cursor-2api 配置文件 (v3.0 - 自主令牌生成版)
+# ====================================================================
+
+# --- 核心安全配置 (推荐设置) ---
+# 用于保护您 API 服务的访问密钥。留空或设为 "1" 表示不设防。
+API_MASTER_KEY=1
+
+# --- 部署配置 (可选) ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8088
+
+
+--- 文件路径: .env.example ---
+
+# ====================================================================
+# cursor-2api 配置文件模板 (v2.0 - Cookie 认证版)
+# ====================================================================
+
+# --- 核心安全配置 (推荐设置) ---
+# 用于保护您 API 服务的访问密钥。
+API_MASTER_KEY=sk-cursor-default-key
+
+# --- Cursor 凭证 (必须设置) ---
+# 请登录 cursor.com，然后从浏览器开发者工具的网络(Network)面板中，
+# 找到对 /api/chat 的请求，并复制其请求头(Request Headers)中的完整 "cookie" 字符串。
+CURSOR_COOKIE="在此处粘贴您的完整 Cookie 字符串"
+
+# --- 部署配置 (可选) ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8088
+
+
+--- 文件路径: Dockerfile ---
+
+# ====================================================================
+# Dockerfile for cursor-2api (v3.1 - Definitive Edition)
+# ====================================================================
+
+FROM python:3.10-slim
+
+# 设置环境变量
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+
+# --- 1. 安装 Python 依赖 ---
+# 首先只复制 requirements.txt 以便利用 Docker 的构建缓存。
+# 只有当 requirements.txt 文件改变时，这一层才会重新构建。
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# --- 2. 安装 Playwright 的系统级依赖 (以 root 身份) ---
+# 使用 python -m playwright 来确保命令可以被找到，这是最稳健的方式。
+RUN python -m playwright install-deps
+
+# --- 3. 复制所有应用代码 ---
+COPY . .
+
+# --- 4. 创建并切换到非 root 用户 ---
+RUN useradd --create-home appuser && \
+    chown -R appuser:appuser /app
+USER appuser
+
+# --- 5. 安装 Playwright 浏览器 (以 appuser 身份) ---
+# 这将确保浏览器被下载到 /home/appuser/.cache/ms-playwright/ 目录下。
+RUN python -m playwright install chromium
+
+# --- 6. 暴露端口并定义启动命令 ---
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+
+
+--- 文件路径: docker-compose.yml ---
+
+# 文件路径: docker-compose.yml
+
+services:
+  nginx:
+    image: nginx:latest
+    container_name: cursor-2api-nginx
+    restart: always
+    ports:
+      - "${NGINX_PORT:-8088}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app
+    networks:
+      - cursor-net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # container_name is removed to allow multiple instances
+    restart: unless-stopped
+    env_file:
+      - .env
+    # shm_size is crucial for Playwright in Docker
+    shm_size: '1gb'
+    networks:
+      - cursor-net
+
+networks:
+  cursor-net:
+    driver: bridge
+
+
+--- 文件路径: main.py ---
+
+# 文件路径: main.py
+
+import logging
+from contextlib import asynccontextmanager
+from typing import Optional
+import nest_asyncio
+
+from fastapi import FastAPI, Request, HTTPException, Depends, Header
+from fastapi.responses import JSONResponse
+
+from app.core.config import settings
+from app.providers.cursor_provider import CursorProvider, PlaywrightManager
+
+nest_asyncio.apply()
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+playwright_manager = PlaywrightManager()
+provider = CursorProvider(playwright_manager)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理，初始化并维护一个持久化的、具备上下文感知能力的浏览器会话。"""
+    logger.info(f"启动 {settings.APP_NAME} v{settings.APP_VERSION} (创世协议)")
+    
+    await playwright_manager.start()
+
+    logger.info("战略核心: 'Playwright' 已激活，持久化个人会话准备就绪。")
+    logger.info(f"服务监听于: http://localhost:{settings.NGINX_PORT}")
+    
+    yield
+    
+    logger.info("应用关闭中...")
+    await playwright_manager.stop()
+    logger.info("Playwright 实例已关闭。")
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    description="一个功能完备、支持动态模型和上下文选择的 cursor.com 代理。",
+    lifespan=lifespan
+)
+
+async def verify_api_key(authorization: Optional[str] = Header(None)):
+    if settings.API_MASTER_KEY and settings.API_MASTER_KEY not in ["1", ""]:
+        if not authorization or "bearer" not in authorization.lower():
+            raise HTTPException(status_code=401, detail="需要 Bearer Token 认证。")
+        token = authorization.split(" ")[-1]
+        if token != settings.API_MASTER_KEY:
+            raise HTTPException(status_code=403, detail="无效的 API Key。")
+
+@app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
+async def chat_completions(request: Request):
+    try:
+        request_data = await request.json()
+        return await provider.chat_completion(request_data)
+    except Exception as e:
+        logger.error(f"处理聊天请求时发生顶层错误: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
+
+@app.get("/v1/models", dependencies=[Depends(verify_api_key)], response_class=JSONResponse)
+async def list_models():
+    return await provider.get_models()
+
+@app.get("/", summary="根路径", include_in_schema=False)
+def root():
+    """根路径，提供服务状态信息"""
+    return {
+        "message": f"欢迎来到 {settings.APP_NAME} v{settings.APP_VERSION}",
+        "status": "ok",
+        "protocol": "Genesis Protocol · G (Final Ultimate Pro Max) - Dynamic & Aware"
+    }
+
+
+--- 文件路径: nginx.conf ---
+
+# 文件路径: nginx.conf
+
+worker_processes auto;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream cursor_backend {
+        # No ip_hash, use default round-robin for load balancing
+        server app:8000;
+    }
+
+    server {
+        listen 80;
+        server_name localhost;
+
+        location / {
+            proxy_pass http://cursor_backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            
+            proxy_buffering off;
+            proxy_cache off;
+            proxy_set_header Connection '';
+            proxy_http_version 1.1;
+            chunked_transfer_encoding off;
+        }
+    }
+}
+
+
+--- 文件路径: requirements.txt ---
+
+fastapi
+uvicorn
+pydantic-settings
+python-dotenv
+httpx
+playwright
+nest-asyncio
+
+
+--- 文件路径: app\core\__init__.py ---
+
+
+
+--- 文件路径: app\core\config.py ---
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import List, Optional
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding='utf-8', extra="ignore")
+
+    APP_NAME: str = "cursor-2api"
+    APP_VERSION: str = "2.0.0"
+    DESCRIPTION: str = "一个将 cursor.com 转换为兼容 OpenAI 格式 API 的高性能代理 (Cookie 认证版)。"
+
+    API_MASTER_KEY: Optional[str] = None
+    NGINX_PORT: int = 8088
+    API_REQUEST_TIMEOUT: int = 180
+    
+    # 新增 Cookie 配置
+    CURSOR_COOKIE: Optional[str] = None
+
+    KNOWN_MODELS: List[str] = [
+        "anthropic/claude-sonnet-4.5",
+        "openai/gpt-5-nano",
+        "google/gemini-2.5-flash"
+    ]
+
+settings = Settings()
+
+
+--- 文件路径: app\providers\__init__.py ---
+
+
+
+--- 文件路径: app\providers\base_provider.py ---
+
+from abc import ABC, abstractmethod
+from typing import Dict, Any, Union
+from fastapi.responses import StreamingResponse, JSONResponse
+
+class BaseProvider(ABC):
+    """
+    定义所有 Provider 必须遵循的抽象基类。
+    """
+    @abstractmethod
+    async def chat_completion(
+        self,
+        request_data: Dict[str, Any]
+    ) -> Union[StreamingResponse, JSONResponse]:
+        """处理聊天补全请求"""
+        pass
+
+    @abstractmethod
+    async def get_models(self) -> JSONResponse:
+        """获取模型列表"""
+        pass
+
+
+--- 文件路径: app\providers\cursor_provider.py ---
+
+# 文件路径: app/providers/cursor_provider.py
+
+import json
+import time
+import logging
+import uuid
+import asyncio
+import re
+from typing import Dict, Any, AsyncGenerator, Union, Optional
+
+from fastapi import HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
+
+from playwright.async_api import async_playwright, Browser, Page, BrowserContext
+
+from app.core.config import settings
+from app.providers.base_provider import BaseProvider
+from app.utils.sse_utils import (
+    create_sse_data,
+    create_chat_completion_chunk,
+    create_non_stream_chat_completion,
+    DONE_CHUNK
+)
+
+logger = logging.getLogger(__name__)
+
+CONTEXT_REFRESH_THRESHOLD = 0.95
+
+class PlaywrightManager:
+    """
+    管理一个唯一的、持久化的浏览器会话，并在启动时完成所有必要的函数绑定。
+    """
+    def __init__(self):
+        self.browser: Optional[Browser] = None
+        self.playwright = None
+        self.context: Optional[BrowserContext] = None
+        self.page: Optional[Page] = None
+        self.queue = asyncio.Queue() # 将队列提升到 Manager 层面
+
+    async def start(self):
+        logger.info("正在启动个人专属的持久化 Playwright 会话...")
+        self.playwright = await async_playwright().start()
+        launch_args = [
+            '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote',
+            '--single-process', '--disable-gpu', '--dns-prefetch-disable'
+        ]
+        self.browser = await self.playwright.chromium.launch(headless=True, args=launch_args)
+        
+        self.context = await self.browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        )
+        self.page = await self.context.new_page()
+
+        # --- 核心修复：在启动时一次性注册所有通信函数 ---
+        logger.info("正在为持久化页面绑定通信桥梁...")
+        await self.page.expose_function("onStreamChunk", self.queue.put_nowait)
+        await self.page.expose_function("onStreamError", lambda error: self.queue.put_nowait(Exception(f"Browser-side error: {error}")))
+        await self.page.expose_function("onStreamEnd", lambda: self.queue.put_nowait(None))
+        logger.info("通信桥梁绑定完成。")
+        # --- 修复结束 ---
+
+        stealth_script = "Object.defineProperty(navigator, 'webdriver', { get: () => false });"
+        await self.page.add_init_script(stealth_script)
+        await self.page.add_init_script(path="app/providers/fetch_override.js")
+
+        await self.page.goto("https://cursor.com/docs", wait_until="networkidle")
+        try:
+            await self.page.locator('button[title="Expand Chat Sidebar"]').click(timeout=5000)
+        except Exception:
+            pass
+
+        logger.info("个人专属的持久化会话已初始化并准备就绪。")
+
+    async def stop(self):
+        if self.page: await self.page.close()
+        if self.context: await self.context.close()
+        if self.browser: await self.browser.close()
+        if self.playwright: await self.playwright.stop()
+        logger.info("持久化 Playwright 会话已关闭。")
+
+class CursorProvider(BaseProvider):
+    """
+    采用“终极单体”架构，具备上下文监控和自动回收能力。
+    """
+    def __init__(self, playwright_manager: PlaywrightManager):
+        self.pm = playwright_manager
+        self._lock = asyncio.Lock()
+
+    async def chat_completion(self, request_data: Dict[str, Any]) -> Union[StreamingResponse, JSONResponse]:
+        async with self._lock:
+            try:
+                is_stream = request_data.get("stream", False)
+                if not is_stream:
+                    raise NotImplementedError("Non-streamed responses are not implemented.")
+
+                return StreamingResponse(
+                    self._execute_and_stream(request_data),
+                    media_type="text/event-stream"
+                )
+            except Exception as e:
+                logger.error(f"处理 chat_completion 时发生顶层错误: {e}", exc_info=True)
+                raise HTTPException(status_code=500, detail=str(e))
+
+    async def _check_and_handle_context_limit(self, page: Page, request_id: str, model_name: str) -> AsyncGenerator[bytes, None]:
+        """检查上下文Token使用情况，如果超限则刷新并发送通知。"""
+        try:
+            context_element_selector = "div.flex-shrink-0.border-border.border-t"
+            element = page.locator(context_element_selector).filter(has_text="上下文")
+            
+            if await element.count() > 0:
+                text_content = await element.inner_text()
+                current_tokens, max_tokens = self._parse_context_tokens(text_content)
+                
+                if current_tokens is not None and max_tokens is not None and max_tokens > 0:
+                    usage_ratio = current_tokens / max_tokens
+                    logger.info(f"当前上下文使用率: {usage_ratio:.2%} ({current_tokens}/{max_tokens})")
+                    
+                    if usage_ratio >= CONTEXT_REFRESH_THRESHOLD:
+                        logger.warning(f"上下文使用率达到阈值，将自动刷新会话。")
+                        notification_chunk = create_chat_completion_chunk(
+                            request_id, model_name, "[系统提示：检测到上下文已满，已为您自动开启新对话。]\n\n"
+                        )
+                        yield create_sse_data(notification_chunk)
+                        
+                        await page.reload(wait_until="networkidle")
+                        await page.locator('button[title="Expand Chat Sidebar"]').click(timeout=5000)
+                        logger.info("页面已刷新，上下文已清空。")
+        except Exception as e:
+            logger.error(f"检查上下文限制时出错: {e}", exc_info=True)
+
+    def _parse_context_tokens(self, text: str) -> (Optional[float], Optional[float]):
+        match = re.search(r'上下文：\s*([\d\.]+)k\s*/\s*([\d\.]+)k', text, re.IGNORECASE)
+        if match:
+            try:
+                current_k = float(match.group(1))
+                max_k = float(match.group(2))
+                return current_k * 1000, max_k * 1000
+            except (ValueError, IndexError):
+                return None, None
+        return None, None
+
+    async def _execute_and_stream(self, request_data: Dict[str, Any]) -> AsyncGenerator[bytes, None]:
+        page = self.pm.page
+        queue = self.pm.queue # 使用共享的队列
+        if not page:
+            raise RuntimeError("持久化页面未初始化。")
+
+        request_id = f"chatcmpl-{uuid.uuid4()}"
+        model_name = request_data.get("model", "anthropic/claude-3.5-sonnet")
+
+        try:
+            # --- 核心修复：不再重复注册函数 ---
+
+            async for notification in self._check_and_handle_context_limit(page, request_id, model_name):
+                yield notification
+
+            payload = self._prepare_payload(request_data)
+            last_user_prompt = self._get_last_user_prompt(request_data)
+            if not last_user_prompt:
+                raise ValueError("请求中不包含有效的用户消息。")
+
+            await page.evaluate("(payload) => { window.chatPayload = payload; }", payload)
+            
+            await page.locator('textarea[placeholder*="Ask"]').fill(last_user_prompt)
+            
+            logger.info("点击发送按钮，触发被代理的 fetch...")
+            await page.locator('button[type="submit"]').click()
+
+            logger.info("等待并实时转换流数据...")
+            buffer = ""
+            while True:
+                item = await asyncio.wait_for(queue.get(), timeout=120)
+                if item is None:
+                    logger.info("流结束。")
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                
+                buffer += item
+                while "\n\n" in buffer:
+                    raw_event, buffer = buffer.split("\n\n", 1)
+                    if raw_event.startswith("data:"):
+                        try:
+                            data_str = raw_event[5:].strip()
+                            if not data_str or data_str == "[DONE]":
+                                continue
+                            
+                            cursor_data = json.loads(data_str)
+                            if cursor_data.get("type") == "text-delta":
+                                delta_content = cursor_data.get("delta", "")
+                                if delta_content:
+                                    openai_chunk = create_chat_completion_chunk(request_id, model_name, delta_content)
+                                    yield create_sse_data(openai_chunk)
+                        except json.JSONDecodeError:
+                            logger.warning(f"无法解析 Cursor 流数据块: {raw_event}")
+                            continue
+        
+        except Exception as e:
+            logger.error(f"流编排失败: {e}", exc_info=True)
+            error_chunk = create_chat_completion_chunk(request_id, model_name, f"Orchestration error: {str(e)}", "error")
+            yield create_sse_data(error_chunk)
+
+        finally:
+            yield DONE_CHUNK
+
+    def _prepare_payload(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
+        user_string = request_data.get("user", "")
+        file_path = "/docs/"
+        if "@" in user_string:
+            parts = user_string.split("@", 1)
+            if len(parts) == 2 and parts[1].startswith("/"):
+                file_path = parts[1]
+                logger.info(f"检测到上下文路径: {file_path}")
+
+        context = [{"type": "file", "content": "", "filePath": file_path}]
+
+        cursor_messages = []
+        for msg in request_data.get("messages", []):
+            role = msg.get("role")
+            content = msg.get("content")
+            
+            if role and content:
+                cursor_messages.append({
+                    "role": role,
+                    "parts": [{"type": "text", "text": content}],
+                    "id": f"msg_{uuid.uuid4().hex[:16]}"
+                })
+
+        return {
+            "context": context,
+            "model": request_data.get("model", "anthropic/claude-3.5-sonnet"),
+            "id": f"req_{uuid.uuid4().hex[:16]}",
+            "messages": cursor_messages,
+            "trigger": "submit-message"
+        }
+
+    def _get_last_user_prompt(self, request_data: Dict[str, Any]) -> str:
+        user_messages = [msg for msg in request_data.get("messages", []) if msg.get("role") == "user"]
+        if not user_messages: return ""
+        
+        last_message_content = user_messages[-1].get("content", "")
+        if isinstance(last_message_content, list):
+            return " ".join(p.get("text", "") for p in last_message_content if p.get("type") == "text")
+        return last_message_content
+    
+    async def get_models(self) -> JSONResponse:
+        model_data = {
+            "object": "list",
+            "data": [{"id": name, "object": "model", "created": int(time.time()), "owned_by": "lzA6"} for name in settings.KNOWN_MODELS]
+        }
+        return JSONResponse(content=model_data)
+
+
+--- 文件路径: app\providers\fetch_override.js ---
+
+// 文件路径: app/providers/fetch_override.js
+
+(function() {
+    const originalFetch = window.fetch;
+
+    window.fetch = new Proxy(originalFetch, {
+        apply: async function(target, thisArg, args) {
+            let [url, config] = args;
+
+            if (typeof url === 'string' && url.includes('/api/chat') && config && config.method === 'POST') {
+                console.log('Apollo Protocol: Intercepting fetch to /api/chat.');
+
+                // --- 核心修改：使用从 Python 注入的、包含完整历史的 payload ---
+                if (window.chatPayload) {
+                    console.log('Apollo Protocol: Overriding request body with payload from Python.');
+                    config.body = JSON.stringify(window.chatPayload);
+                    // 更新 args[1] 以确保修改生效
+                    args[1] = config;
+                } else {
+                    console.warn('Apollo Protocol: window.chatPayload not found. Using original request body.');
+                }
+                // --- 修改结束 ---
+
+                try {
+                    const response = await Reflect.apply(target, thisArg, args);
+
+                    if (!response.ok) {
+                        const errorText = await response.text();
+                        const errorMessage = `Fetch failed via proxy: ${response.status} ${response.statusText}. Body: ${errorText}`;
+                        if (window.onStreamError) window.onStreamError(errorMessage);
+                        return new Response(errorText, { status: response.status, headers: response.headers });
+                    }
+
+                    if (!response.body) {
+                        if (window.onStreamError) window.onStreamError('Response has no body');
+                        return response;
+                    }
+
+                    const [streamForPython, streamForBrowser] = response.body.tee();
+
+                    (async () => {
+                        const reader = streamForPython.getReader();
+                        const decoder = new TextDecoder();
+                        try {
+                            while (true) {
+                                const { done, value } = await reader.read();
+                                if (done) break;
+                                const chunk = decoder.decode(value, { stream: true });
+                                if (window.onStreamChunk) window.onStreamChunk(chunk);
+                            }
+                        } catch (e) {
+                            if (window.onStreamError) window.onStreamError('Error reading stream: ' + e.toString());
+                        } finally {
+                            if (window.onStreamEnd) window.onStreamEnd();
+                        }
+                    })();
+                    
+                    return new Response(streamForBrowser, {
+                        status: response.status,
+                        statusText: response.statusText,
+                        headers: response.headers,
+                    });
+
+                } catch (error) {
+                    if (window.onStreamError) window.onStreamError(error.toString());
+                    throw error;
+                }
+            }
+
+            return Reflect.apply(target, thisArg, args);
+        }
+    });
+})();
+
+
+--- 文件路径: app\utils\sse_utils.py ---
+
+import json
+import time
+from typing import Dict, Any, Optional
+
+# SSE 'data: [DONE]' 结束标志
+DONE_CHUNK = b"data: [DONE]\n\n"
+
+def create_sse_data(data: Dict[str, Any]) -> bytes:
+    """将字典转换为 SSE 格式的字节串"""
+    return f"data: {json.dumps(data)}\n\n".encode('utf-8')
+
+def create_chat_completion_chunk(
+    request_id: str,
+    model: str,
+    content: str,
+    finish_reason: Optional[str] = None
+) -> Dict[str, Any]:
+    """创建 OpenAI 格式的流式聊天补全块"""
+    return {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": finish_reason,
+                "logprobs": None
+            }
+        ],
+    }
+
+def create_non_stream_chat_completion(
+    request_id: str,
+    model: str,
+    content: str,
+    finish_reason: str = "stop"
+) -> Dict[str, Any]:
+    """创建 OpenAI 格式的非流式聊天补全响应"""
+    created_time = int(time.time())
+    return {
+        "id": request_id,
+        "object": "chat.completion",
+        "created": created_time,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                },
+                "finish_reason": finish_reason,
+            }
+        ],
+        "usage": {
+            "prompt_tokens": -1,  # 无法精确计算，设为-1
+            "completion_tokens": len(content),
+            "total_tokens": -1,
+        },
+    }
+
+
+
